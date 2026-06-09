@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/create-attendance-excel.js": {
+      "maxDuration": 60
+    }
+  }
+}
