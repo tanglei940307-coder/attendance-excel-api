@@ -1,0 +1,12 @@
+{
+  "name": "attendance-excel-api",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "vercel dev"
+  },
+  "dependencies": {
+    "@vercel/blob": "latest",
+    "exceljs": "latest"
+  }
+}
