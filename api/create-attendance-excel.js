@@ -1,230 +1,298 @@
-import ExcelJS from "exceljs";
-import { put } from "@vercel/blob";
+const ExcelJS = require("exceljs");
 
-function parseMaybeJson(value) {
-  if (!value) return {};
-  if (typeof value === "object") return value;
-
-  try {
-    return JSON.parse(value);
-  } catch {
-    return {};
-  }
+function sendJson(res, statusCode, data) {
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(data));
 }
 
-function safeFileName(name) {
-  const raw = String(name || "临时工工时待核对表.xlsx").trim();
-  const cleaned = raw.replace(/[\\/:*?"<>|]/g, "_");
-  return cleaned.endsWith(".xlsx") ? cleaned : `${cleaned}.xlsx`;
+function getApiKey(req) {
+  return (
+    req.headers["x-api-key"] ||
+    req.headers["X-API-Key"] ||
+    req.headers["authorization"] ||
+    ""
+  );
 }
 
-function safeSheetName(name, usedNames) {
-  let s = String(name || "Sheet").trim();
+function checkApiKey(req) {
+  const apiKey = process.env.API_KEY || "";
+  const requestKey = String(getApiKey(req) || "").replace(/^Bearer\s+/i, "");
 
-  s = s.replace(/[\\/?*[\]:]/g, "");
-  s = s.slice(0, 31) || "Sheet";
-
-  let finalName = s;
-  let i = 1;
-
-  while (usedNames.has(finalName)) {
-    const suffix = `_${i}`;
-    finalName = s.slice(0, 31 - suffix.length) + suffix;
-    i += 1;
+  if (!apiKey) {
+    return false;
   }
 
-  usedNames.add(finalName);
-  return finalName;
+  return requestKey === apiKey;
 }
 
-function isHeaderRow(row) {
-  return Array.isArray(row) && row.includes("序号") && row.includes("姓名");
+function getFileUrlFromBody(body) {
+  if (!body) return "";
+
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body);
+    } catch (e) {
+      return "";
+    }
+  }
+
+  if (body.file_url) return String(body.file_url);
+  if (body.url) return String(body.url);
+  if (body.excel_url) return String(body.excel_url);
+
+  const file = body.correction_file || body.file || body.excel_file;
+
+  if (typeof file === "string") {
+    return file;
+  }
+
+  if (file && typeof file === "object") {
+    if (file.url) return String(file.url);
+    if (file.file_url) return String(file.file_url);
+    if (file.download_url) return String(file.download_url);
+    if (file.uri) return String(file.uri);
+  }
+
+  return "";
 }
 
-function isGroupRow(row) {
-  return Array.isArray(row) && row.length === 1 && String(row[0] || "").startsWith("工作组：");
+function normalizeHeader(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, "");
 }
 
-function isTitleRow(row) {
-  return Array.isArray(row) && row.length === 1 && String(row[0] || "").includes("工时");
+function normalizeCell(value) {
+  if (value === null || value === undefined) return "";
+
+  if (typeof value === "object") {
+    if (value.text !== undefined) return String(value.text).trim();
+    if (value.result !== undefined) return String(value.result).trim();
+    if (value.richText && Array.isArray(value.richText)) {
+      return value.richText.map(item => item.text || "").join("").trim();
+    }
+  }
+
+  return String(value).trim();
 }
 
-function styleWorksheet(ws) {
-  ws.views = [{ state: "frozen", ySplit: 1 }];
+function worksheetToRows(worksheet) {
+  const rows = [];
 
-  ws.eachRow((row) => {
-    row.height = 22;
+  worksheet.eachRow({ includeEmpty: true }, row => {
+    const values = [];
 
-    row.eachCell((cell) => {
-      cell.alignment = {
-        vertical: "middle",
-        horizontal: "center",
-        wrapText: true
-      };
-
-      cell.border = {
-        top: { style: "thin", color: { argb: "FFD9D9D9" } },
-        left: { style: "thin", color: { argb: "FFD9D9D9" } },
-        bottom: { style: "thin", color: { argb: "FFD9D9D9" } },
-        right: { style: "thin", color: { argb: "FFD9D9D9" } }
-      };
+    row.eachCell({ includeEmpty: true }, cell => {
+      values.push(normalizeCell(cell.value));
     });
 
-    const values = row.values.slice(1);
+    rows.push(values);
+  });
 
-    if (isTitleRow(values)) {
-      row.height = 28;
-      row.eachCell((cell) => {
-        cell.font = { bold: true, size: 14 };
-        cell.fill = {
-          type: "pattern",
-          pattern: "solid",
-          fgColor: { argb: "FFE2F0D9" }
-        };
-      });
+  return rows;
+}
+
+function findHeaderRow(rows) {
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i] || [];
+    const headers = row.map(normalizeHeader);
+
+    const hasAbnormalId =
+      headers.includes("异常ID") ||
+      headers.includes("异常id") ||
+      headers.includes("abnormal_id");
+
+    const hasCorrectValue =
+      headers.includes("修正值") ||
+      headers.includes("correct_value") ||
+      headers.includes("确认值");
+
+    if (hasAbnormalId && hasCorrectValue) {
+      return i;
     }
+  }
 
-    if (isGroupRow(values)) {
-      row.eachCell((cell) => {
-        cell.font = { bold: true };
-        cell.fill = {
-          type: "pattern",
-          pattern: "solid",
-          fgColor: { argb: "FFFFF2CC" }
-        };
-      });
-    }
+  return -1;
+}
 
-    if (isHeaderRow(values)) {
-      row.eachCell((cell) => {
-        cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
-        cell.fill = {
-          type: "pattern",
-          pattern: "solid",
-          fgColor: { argb: "FF4472C4" }
-        };
-      });
+function buildHeaderMap(headerRow) {
+  const map = {};
+
+  headerRow.forEach((cell, index) => {
+    const key = normalizeHeader(cell);
+    if (key) {
+      map[key] = index;
     }
   });
 
-  for (let i = 1; i <= ws.columnCount; i++) {
-    const col = ws.getColumn(i);
-
-    if (i === 1) {
-      col.width = 8;
-    } else if (i === 2) {
-      col.width = 14;
-    } else if (i >= 3 && i <= 33) {
-      col.width = 7;
-    } else {
-      col.width = 14;
-    }
-  }
+  return map;
 }
 
-function addRowsToSheet(ws, rows) {
-  rows.forEach((row) => {
-    ws.addRow(Array.isArray(row) ? row : [String(row || "")]);
-  });
+function getCell(row, headerMap, names) {
+  for (const name of names) {
+    const key = normalizeHeader(name);
+    const index = headerMap[key];
 
-  if (ws.rowCount > 0 && ws.columnCount > 1) {
-    try {
-      ws.mergeCells(1, 1, 1, Math.min(ws.columnCount, 40));
-      const firstRow = ws.getRow(1);
-      firstRow.alignment = {
-        vertical: "middle",
-        horizontal: "center",
-        wrapText: true
-      };
-    } catch {
-      // 如果合并失败，不影响文件生成
-    }
-  }
-}
+    if (index !== undefined && index !== null) {
+      const value = row[index];
 
-export default async function handler(req, res) {
-  try {
-    if (req.method === "OPTIONS") {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key");
-      return res.status(204).end();
-    }
-
-    if (req.method !== "POST") {
-      return res.status(405).json({
-        success: false,
-        message: "Only POST is allowed"
-      });
-    }
-
-    const apiKey = process.env.API_KEY || "";
-    if (apiKey) {
-      const requestKey = req.headers["x-api-key"];
-      if (requestKey !== apiKey) {
-        return res.status(401).json({
-          success: false,
-          message: "Unauthorized"
-        });
+      if (value !== undefined && value !== null) {
+        return String(value).trim();
       }
     }
+  }
 
-    const body = parseMaybeJson(req.body);
-    const excelData = parseMaybeJson(body.excel_data);
+  return "";
+}
 
-    const fileName = safeFileName(
-      body.file_name || excelData.file_name || "临时工工时待核对表.xlsx"
+function getCellNumber(row, headerMap, names) {
+  const value = getCell(row, headerMap, names);
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function parseCorrectionRows(workbook) {
+  let worksheet = workbook.getWorksheet("异常待确认");
+
+  if (!worksheet) {
+    worksheet = workbook.worksheets.find(ws =>
+      String(ws.name || "").includes("异常")
     );
+  }
 
-    const sheets = Array.isArray(excelData.sheets) ? excelData.sheets : [];
+  if (!worksheet) {
+    return {
+      sheet_name: "",
+      rows: [],
+      message: "未找到“异常待确认”工作表"
+    };
+  }
 
-    if (sheets.length === 0) {
-      return res.status(400).json({
+  const rows = worksheetToRows(worksheet);
+  const headerRowIndex = findHeaderRow(rows);
+
+  if (headerRowIndex < 0) {
+    return {
+      sheet_name: worksheet.name,
+      rows: [],
+      message: "未找到包含“异常ID”和“修正值”的表头行"
+    };
+  }
+
+  const headerRow = rows[headerRowIndex];
+  const headerMap = buildHeaderMap(headerRow);
+  const dataRows = rows.slice(headerRowIndex + 1);
+
+  const corrections = [];
+
+  for (const row of dataRows) {
+    const abnormalId = getCell(row, headerMap, [
+      "异常ID",
+      "异常id",
+      "abnormal_id"
+    ]);
+
+    const correctValue = getCell(row, headerMap, [
+      "修正值",
+      "correct_value",
+      "确认值"
+    ]);
+
+    const correctRemark = getCell(row, headerMap, [
+      "修正备注",
+      "correct_remark",
+      "备注"
+    ]);
+
+    if (!abnormalId) continue;
+    if (!correctValue) continue;
+
+    corrections.push({
+      abnormal_id: abnormalId,
+      batch_id: getCell(row, headerMap, ["批次ID", "batch_id"]),
+      month: getCell(row, headerMap, ["月份", "month"]),
+      company_name: getCell(row, headerMap, ["外包公司", "company_name"]),
+      work_group: getCell(row, headerMap, ["工作组", "work_group"]),
+      employee_name: getCell(row, headerMap, ["员工", "employee_name"]),
+      attendance_date: getCell(row, headerMap, ["考勤日期", "attendance_date"]),
+      day_number: getCellNumber(row, headerMap, ["日", "day_number"]),
+      raw_text: getCell(row, headerMap, ["原始内容", "raw_text"]),
+      reason: getCell(row, headerMap, ["异常原因", "reason"]),
+      status: getCell(row, headerMap, ["当前状态", "status"]),
+      source_image_index: getCell(row, headerMap, [
+        "来源图片序号",
+        "source_image_index"
+      ]),
+      source_image_name: getCell(row, headerMap, [
+        "来源图片名称",
+        "source_image_name"
+      ]),
+      correct_value: correctValue,
+      correct_remark: correctRemark
+    });
+  }
+
+  return {
+    sheet_name: worksheet.name,
+    rows: corrections,
+    message: "解析成功"
+  };
+}
+
+module.exports = async function handler(req, res) {
+  try {
+    if (req.method !== "POST") {
+      return sendJson(res, 405, {
         success: false,
-        message: "excel_data.sheets 为空，无法生成 Excel"
+        message: "Method Not Allowed"
       });
     }
 
-    const workbook = new ExcelJS.Workbook();
-    workbook.creator = "Coze Attendance Bot";
-    workbook.created = new Date();
-
-    const usedSheetNames = new Set();
-
-    for (const sheetData of sheets) {
-      const sheetName = safeSheetName(sheetData.sheet_name, usedSheetNames);
-      const rows = Array.isArray(sheetData.rows) ? sheetData.rows : [];
-
-      const ws = workbook.addWorksheet(sheetName);
-      addRowsToSheet(ws, rows);
-      styleWorksheet(ws);
+    if (!checkApiKey(req)) {
+      return sendJson(res, 401, {
+        success: false,
+        message: "Unauthorized"
+      });
     }
 
-    const buffer = await workbook.xlsx.writeBuffer();
+    const fileUrl = getFileUrlFromBody(req.body);
 
-    const timestamp = Date.now();
-    const blobName = `attendance/${timestamp}_${fileName}`;
+    if (!fileUrl) {
+      return sendJson(res, 400, {
+        success: false,
+        message: "缺少 Excel 文件链接 file_url"
+      });
+    }
 
-    const blob = await put(blobName, buffer, {
-      access: "public",
-      contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    });
+    const fileResp = await fetch(fileUrl);
 
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    if (!fileResp.ok) {
+      return sendJson(res, 400, {
+        success: false,
+        message: `Excel 文件下载失败：${fileResp.status}`
+      });
+    }
 
-    return res.status(200).json({
+    const arrayBuffer = await fileResp.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(buffer);
+
+    const parsed = parseCorrectionRows(workbook);
+
+    return sendJson(res, 200, {
       success: true,
-      file_name: fileName,
-      file_url: blob.url,
-      message: "Excel生成成功"
+      message: parsed.message,
+      sheet_name: parsed.sheet_name,
+      correction_rows: parsed.rows,
+      correction_count: parsed.rows.length
     });
   } catch (error) {
-    console.error(error);
-
-    return res.status(500).json({
+    return sendJson(res, 500, {
       success: false,
-      message: "Excel生成失败",
-      error: error.message
+      message: error && error.message ? error.message : "解析修正 Excel 失败"
     });
   }
-}
+};
