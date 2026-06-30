@@ -1,9 +1,17 @@
-const ExcelJS = require("exceljs");
+import ExcelJS from "exceljs";
 
-function sendJson(res, statusCode, data) {
-  res.statusCode = statusCode;
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.end(JSON.stringify(data));
+function parseMaybeJson(value) {
+  if (!value) return {};
+
+  if (typeof value === "object") {
+    return value;
+  }
+
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
+  }
 }
 
 function getApiKey(req) {
@@ -29,22 +37,34 @@ function checkApiKey(req) {
 function getFileUrlFromBody(body) {
   if (!body) return "";
 
-  if (typeof body === "string") {
-    try {
-      body = JSON.parse(body);
-    } catch (e) {
-      return "";
-    }
-  }
+  const parsedBody = parseMaybeJson(body);
 
-  if (body.file_url) return String(body.file_url);
-  if (body.url) return String(body.url);
-  if (body.excel_url) return String(body.excel_url);
+  if (parsedBody.file_url) return String(parsedBody.file_url);
+  if (parsedBody.url) return String(parsedBody.url);
+  if (parsedBody.excel_url) return String(parsedBody.excel_url);
+  if (parsedBody.download_url) return String(parsedBody.download_url);
 
-  const file = body.correction_file || body.file || body.excel_file;
+  const file =
+    parsedBody.correction_file ||
+    parsedBody.file ||
+    parsedBody.excel_file ||
+    parsedBody.input_file;
 
   if (typeof file === "string") {
     return file;
+  }
+
+  if (Array.isArray(file) && file.length > 0) {
+    const first = file[0];
+
+    if (typeof first === "string") return first;
+
+    if (first && typeof first === "object") {
+      if (first.url) return String(first.url);
+      if (first.file_url) return String(first.file_url);
+      if (first.download_url) return String(first.download_url);
+      if (first.uri) return String(first.uri);
+    }
   }
 
   if (file && typeof file === "object") {
@@ -67,10 +87,23 @@ function normalizeCell(value) {
   if (value === null || value === undefined) return "";
 
   if (typeof value === "object") {
-    if (value.text !== undefined) return String(value.text).trim();
-    if (value.result !== undefined) return String(value.result).trim();
+    if (value.text !== undefined) {
+      return String(value.text).trim();
+    }
+
+    if (value.result !== undefined) {
+      return String(value.result).trim();
+    }
+
     if (value.richText && Array.isArray(value.richText)) {
-      return value.richText.map(item => item.text || "").join("").trim();
+      return value.richText
+        .map(item => item.text || "")
+        .join("")
+        .trim();
+    }
+
+    if (value.hyperlink && value.text) {
+      return String(value.text).trim();
     }
   }
 
@@ -83,9 +116,12 @@ function worksheetToRows(worksheet) {
   worksheet.eachRow({ includeEmpty: true }, row => {
     const values = [];
 
-    row.eachCell({ includeEmpty: true }, cell => {
+    const maxColumn = worksheet.columnCount || row.cellCount || 0;
+
+    for (let col = 1; col <= maxColumn; col++) {
+      const cell = row.getCell(col);
       values.push(normalizeCell(cell.value));
-    });
+    }
 
     rows.push(values);
   });
@@ -121,6 +157,7 @@ function buildHeaderMap(headerRow) {
 
   headerRow.forEach((cell, index) => {
     const key = normalizeHeader(cell);
+
     if (key) {
       map[key] = index;
     }
@@ -164,7 +201,8 @@ function parseCorrectionRows(workbook) {
   if (!worksheet) {
     return {
       sheet_name: "",
-      rows: [],
+      correction_rows: [],
+      correction_count: 0,
       message: "未找到“异常待确认”工作表"
     };
   }
@@ -175,7 +213,8 @@ function parseCorrectionRows(workbook) {
   if (headerRowIndex < 0) {
     return {
       sheet_name: worksheet.name,
-      rows: [],
+      correction_rows: [],
+      correction_count: 0,
       message: "未找到包含“异常ID”和“修正值”的表头行"
     };
   }
@@ -184,7 +223,7 @@ function parseCorrectionRows(workbook) {
   const headerMap = buildHeaderMap(headerRow);
   const dataRows = rows.slice(headerRowIndex + 1);
 
-  const corrections = [];
+  const correctionRows = [];
 
   for (const row of dataRows) {
     const abnormalId = getCell(row, headerMap, [
@@ -208,7 +247,7 @@ function parseCorrectionRows(workbook) {
     if (!abnormalId) continue;
     if (!correctValue) continue;
 
-    corrections.push({
+    correctionRows.push({
       abnormal_id: abnormalId,
       batch_id: getCell(row, headerMap, ["批次ID", "batch_id"]),
       month: getCell(row, headerMap, ["月份", "month"]),
@@ -235,31 +274,40 @@ function parseCorrectionRows(workbook) {
 
   return {
     sheet_name: worksheet.name,
-    rows: corrections,
+    correction_rows: correctionRows,
+    correction_count: correctionRows.length,
     message: "解析成功"
   };
 }
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   try {
+    if (req.method === "OPTIONS") {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key");
+      return res.status(204).end();
+    }
+
     if (req.method !== "POST") {
-      return sendJson(res, 405, {
+      return res.status(405).json({
         success: false,
-        message: "Method Not Allowed"
+        message: "Only POST is allowed"
       });
     }
 
     if (!checkApiKey(req)) {
-      return sendJson(res, 401, {
+      return res.status(401).json({
         success: false,
         message: "Unauthorized"
       });
     }
 
-    const fileUrl = getFileUrlFromBody(req.body);
+    const body = parseMaybeJson(req.body);
+    const fileUrl = getFileUrlFromBody(body);
 
     if (!fileUrl) {
-      return sendJson(res, 400, {
+      return res.status(400).json({
         success: false,
         message: "缺少 Excel 文件链接 file_url"
       });
@@ -268,7 +316,7 @@ module.exports = async function handler(req, res) {
     const fileResp = await fetch(fileUrl);
 
     if (!fileResp.ok) {
-      return sendJson(res, 400, {
+      return res.status(400).json({
         success: false,
         message: `Excel 文件下载失败：${fileResp.status}`
       });
@@ -282,17 +330,22 @@ module.exports = async function handler(req, res) {
 
     const parsed = parseCorrectionRows(workbook);
 
-    return sendJson(res, 200, {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
+    return res.status(200).json({
       success: true,
       message: parsed.message,
       sheet_name: parsed.sheet_name,
-      correction_rows: parsed.rows,
-      correction_count: parsed.rows.length
+      correction_rows: parsed.correction_rows,
+      correction_count: parsed.correction_count
     });
   } catch (error) {
-    return sendJson(res, 500, {
+    console.error(error);
+
+    return res.status(500).json({
       success: false,
-      message: error && error.message ? error.message : "解析修正 Excel 失败"
+      message: "解析修正 Excel 失败",
+      error: error.message
     });
   }
-};
+}
