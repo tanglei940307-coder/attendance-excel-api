@@ -1,4 +1,4 @@
-const XLSX = require("xlsx");
+const ExcelJS = require("exceljs");
 
 function sendJson(res, statusCode, data) {
   res.statusCode = statusCode;
@@ -43,7 +43,9 @@ function getFileUrlFromBody(body) {
 
   const file = body.correction_file || body.file || body.excel_file;
 
-  if (typeof file === "string") return file;
+  if (typeof file === "string") {
+    return file;
+  }
 
   if (file && typeof file === "object") {
     if (file.url) return String(file.url);
@@ -61,6 +63,36 @@ function normalizeHeader(value) {
     .replace(/\s+/g, "");
 }
 
+function normalizeCell(value) {
+  if (value === null || value === undefined) return "";
+
+  if (typeof value === "object") {
+    if (value.text !== undefined) return String(value.text).trim();
+    if (value.result !== undefined) return String(value.result).trim();
+    if (value.richText && Array.isArray(value.richText)) {
+      return value.richText.map(item => item.text || "").join("").trim();
+    }
+  }
+
+  return String(value).trim();
+}
+
+function worksheetToRows(worksheet) {
+  const rows = [];
+
+  worksheet.eachRow({ includeEmpty: true }, row => {
+    const values = [];
+
+    row.eachCell({ includeEmpty: true }, cell => {
+      values.push(normalizeCell(cell.value));
+    });
+
+    rows.push(values);
+  });
+
+  return rows;
+}
+
 function findHeaderRow(rows) {
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i] || [];
@@ -68,8 +100,8 @@ function findHeaderRow(rows) {
 
     const hasAbnormalId =
       headers.includes("异常ID") ||
-      headers.includes("abnormal_id") ||
-      headers.includes("异常id");
+      headers.includes("异常id") ||
+      headers.includes("abnormal_id");
 
     const hasCorrectValue =
       headers.includes("修正值") ||
@@ -104,6 +136,7 @@ function getCell(row, headerMap, names) {
 
     if (index !== undefined && index !== null) {
       const value = row[index];
+
       if (value !== undefined && value !== null) {
         return String(value).trim();
       }
@@ -120,12 +153,15 @@ function getCellNumber(row, headerMap, names) {
 }
 
 function parseCorrectionRows(workbook) {
-  const sheetName =
-    workbook.SheetNames.find(name => String(name).trim() === "异常待确认") ||
-    workbook.SheetNames.find(name => String(name).includes("异常")) ||
-    "";
+  let worksheet = workbook.getWorksheet("异常待确认");
 
-  if (!sheetName) {
+  if (!worksheet) {
+    worksheet = workbook.worksheets.find(ws =>
+      String(ws.name || "").includes("异常")
+    );
+  }
+
+  if (!worksheet) {
     return {
       sheet_name: "",
       rows: [],
@@ -133,19 +169,12 @@ function parseCorrectionRows(workbook) {
     };
   }
 
-  const sheet = workbook.Sheets[sheetName];
-
-  const rows = XLSX.utils.sheet_to_json(sheet, {
-    header: 1,
-    defval: "",
-    raw: false
-  });
-
+  const rows = worksheetToRows(worksheet);
   const headerRowIndex = findHeaderRow(rows);
 
   if (headerRowIndex < 0) {
     return {
-      sheet_name: sheetName,
+      sheet_name: worksheet.name,
       rows: [],
       message: "未找到包含“异常ID”和“修正值”的表头行"
     };
@@ -205,7 +234,7 @@ function parseCorrectionRows(workbook) {
   }
 
   return {
-    sheet_name: sheetName,
+    sheet_name: worksheet.name,
     rows: corrections,
     message: "解析成功"
   };
@@ -248,11 +277,8 @@ module.exports = async function handler(req, res) {
     const arrayBuffer = await fileResp.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    const workbook = XLSX.read(buffer, {
-      type: "buffer",
-      cellDates: false,
-      cellText: true
-    });
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(buffer);
 
     const parsed = parseCorrectionRows(workbook);
 
